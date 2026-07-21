@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "anova-ble"
-version = "0.1.6"
+version = "0.1.7"
 description = ""
 authors = ["ninjawarrior1337 <me@treelar.xyz>"]
 readme = "README.md"
