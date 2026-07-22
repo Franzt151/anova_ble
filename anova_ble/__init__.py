@@ -52,6 +52,10 @@ class AnovaBLEPrecisionCooker():
         self._cached_services = None
         self._client = None
         self._cmd_lock = asyncio.Lock()
+        # Responses arrive on a single notify characteristic. We subscribe
+        # once per connection and funnel every packet into this queue,
+        # instead of subscribing/unsubscribing around each command.
+        self._notify_queue: asyncio.Queue[bytearray] = asyncio.Queue()
 
     def set_ble_device(self, device: BLEDevice):
         # NOTE: do NOT clear self._client here. This callback fires on every
@@ -77,9 +81,21 @@ class AnovaBLEPrecisionCooker():
                 cached_services=self._cached_services,
                 ble_device_callback=lambda: self.ble_device
             )
+            # Cache the resolved GATT services so subsequent reconnects can
+            # skip service discovery, which is one of the slowest parts of
+            # establishing a BLE connection. Without this the cache passed
+            # above is always None and discovery runs every single time.
+            self._cached_services = self._client.services
+            await self._client.start_notify(
+                DEVICE_NOTIFICATION_CHAR_UUID, self._handle_notify
+            )
             _LOGGER.debug(f"{self.name}: Connected; MAC: {self.ble_device.address}")
         except Exception as e:
             raise AnovaConnectionException() from e
+
+    def _handle_notify(self, _char: BleakGATTCharacteristic, data: bytearray) -> None:
+        """Receive a response packet from the cooker."""
+        self._notify_queue.put_nowait(data)
 
     def _disconnected(self, client: BleakClient):
         _LOGGER.debug(f"${self.name}: Disconnected from device; MAC {self.ble_device.address}")
@@ -103,19 +119,24 @@ class AnovaBLEPrecisionCooker():
                 READ_CURRENT_TEMP,
                 READ_TARGET_TEMP,
                 READ_TIMER,
-                READ_UNIT
             ]
+            # The unit can't change by itself, so read it only on the first
+            # successful poll and reuse it after that. Saves one full command
+            # round-trip on every subsequent update.
+            if self.state is None:
+                commands.append(READ_UNIT)
 
-            res: list[str] = await asyncio.gather(*[
-                self._do_command(x)
-                for x in commands
-            ])
+            # These serialize on _cmd_lock anyway, so run them in order
+            # rather than pretending to gather them concurrently.
+            res: list[str] = []
+            for command in commands:
+                res.append(await self._do_command(command))
 
             status = AnovaStatus(res[0])
             current_temp = float(res[1])
             target_temp = float(res[2])
             timer = (int(res[3].split()[0]), AnovaStatus(res[3].split()[1]))
-            unit = AnovaTemperatureUnit(res[4])
+            unit = AnovaTemperatureUnit(res[4]) if len(res) > 4 else self.state.unit
 
             self.state = AnovaState(
                 status,
@@ -160,15 +181,13 @@ class AnovaBLEPrecisionCooker():
         
         cmd_bytes = cmd.encode() + ('\r'.encode())
 
-        q: asyncio.Queue[bytearray] = asyncio.Queue()
-
-        async def cb_command_response(char: BleakGATTCharacteristic, data: bytearray):
-            await q.put(data)
-
         async with self._cmd_lock:
-            await self._client.start_notify(DEVICE_NOTIFICATION_CHAR_UUID, cb_command_response)
+            # Drop any late response left over from a previous command so we
+            # don't mistake it for the reply to this one.
+            while not self._notify_queue.empty():
+                self._notify_queue.get_nowait()
+
             await self._client.write_gatt_char(DEVICE_NOTIFICATION_CHAR_UUID, cmd_bytes)
-            res = await q.get()
-            await self._client.stop_notify(DEVICE_NOTIFICATION_CHAR_UUID)
+            res = await asyncio.wait_for(self._notify_queue.get(), timeout=10)
 
         return res.decode().strip()
