@@ -54,8 +54,13 @@ class AnovaBLEPrecisionCooker():
         self._cmd_lock = asyncio.Lock()
 
     def set_ble_device(self, device: BLEDevice):
+        # NOTE: do NOT clear self._client here. This callback fires on every
+        # BLE advertisement. Dropping the client reference without
+        # disconnecting leaks the existing connection and forces a reconnect
+        # on the next poll, which single-connection devices like the Anova
+        # cannot survive. establish_connection() already refreshes the
+        # device via ble_device_callback.
         self.ble_device = device
-        self._client = None
 
     async def connect(self) -> None:
         if self._client and self._client.is_connected:
@@ -167,4 +172,3 @@ class AnovaBLEPrecisionCooker():
             await self._client.stop_notify(DEVICE_NOTIFICATION_CHAR_UUID)
 
         return res.decode().strip()
-        
